@@ -9,11 +9,14 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::{Path, Point, Rect};
+use crate::{Path, Point, Rect, SCALAR_SIN_COS_NEARLY_ZERO, Transform};
 
 use crate::path::PathVerb;
 use crate::path_geometry;
+use crate::path_geometry::Conic;
 use crate::scalar::{Scalar, SCALAR_ROOT_2_OVER_2};
+
+const MAX_CONICS_FOR_ARC: usize = 5;
 
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub(crate) enum PathDirection {
@@ -233,6 +236,76 @@ impl PathBuilder {
         self.cubic_to(p1.x, p1.y, p2.x, p2.y, p.x, p.y);
     }
 
+    /// Adds a arc contour bounded by the provided rectangle and angles.
+    ///
+    /// Arc added is part of ellipse bounded by oval, from startAngle through sweepAngle. Both startAngle and sweepAngle are measured in degrees, where zero degrees is aligned with the positive x-axis, and positive sweeps extends arc clockwise.
+    pub fn arc_to(&mut self, oval: Rect, start_angle_deg: f32, sweep_angle_deg: f32, mut force_move_to: bool) {
+        if oval.width() < 0. || oval.height() < 0. {
+            return;
+        }
+
+        if self.verbs.is_empty() {
+            force_move_to = true;
+        }
+
+        if let Some(lone_point) = arc_is_lone_point(oval, start_angle_deg, sweep_angle_deg) {
+            if force_move_to {
+                self.move_to(lone_point.x, lone_point.y);
+            }
+            else {
+                self.line_to(lone_point.x, lone_point.y);
+            }
+            return;
+        }
+
+        let (start_v, stop_v, dir) = angles_to_unit_vectors(start_angle_deg, sweep_angle_deg);
+
+        // Adds a move-to to 'pt' if forceMoveTo is true. Otherwise a lineTo unless we're sufficiently
+        // close to 'pt' currently. This prevents spurious lineTos when adding a series of contiguous
+        // arcs from the same oval.
+        // FIXME: This closure is of dubious value
+        let add_pt = |this: &mut PathBuilder, point: Point| {
+            if force_move_to {
+                this.move_to(point.x, point.y)
+            }
+            else if !nearly_equal(this.last_point(), point) {
+                this.line_to(point.x, point.y)
+            }
+        };
+
+        // At this point, we know that the arc is not a lone point, but startV == stopV
+        // indicates that the sweepAngle is too small such that angles_to_unit_vectors
+        // cannot handle it.
+        if start_v == stop_v {
+            let end_angle = (start_angle_deg + sweep_angle_deg).to_radians();
+            let radius_x = oval.width().half();
+            let radius_y = oval.height().half();
+            // We do not use SkScalar[Sin|Cos]SnapToZero here. When sin(startAngle) is 0 and sweepAngle
+            // is very small and radius is huge, the expected behavior here is to draw a line. But
+            // calling SkScalarSinSnapToZero will make sin(endAngle) be 0 which will then draw a dot.
+            // let center_x = oval.left().half() + oval.right().half();
+            // let center_y = oval.top().half() + oval.bottom().half();
+            let single_pt = Point::from_xy(oval.center_x() + radius_x * end_angle.cos(), oval.center_y() + radius_y + end_angle.cos());
+            add_pt(self, single_pt);
+            return;
+        }
+
+        let mut single_pt = Point::default(); // FIXME: return this from build_arc_conics
+        let mut conics = [Conic::default(); MAX_CONICS_FOR_ARC];
+        let count = build_arc_conics(oval, start_v, stop_v, dir, &mut conics, &mut single_pt);
+        if count > 0 {
+            self.reserve(0, count * 2 + 1);
+            let pt = &conics[0].points[0];
+            add_pt(self, *pt);
+            for i in 0..count {
+                self.conic_points_to(conics[i].points[1], conics[i].points[2], conics[i].weight);
+            }
+        }
+        else {
+            add_pt(self, single_pt);
+        }
+    }
+
     /// Closes the current contour.
     ///
     /// A closed contour connects the first and the last Point
@@ -427,3 +500,91 @@ impl PathBuilder {
         })
     }
 }
+
+fn arc_is_lone_point(oval: Rect, start_angle: f32, sweep_angle: f32) -> Option<Point> {
+    if sweep_angle == 0. && (start_angle == 0. || start_angle == 360.) {
+        return Some(Point::from_xy(oval.right(), oval.center_y()))
+    }
+    else if oval.width() == 0. && oval.height() == 0. {
+        return Some(Point::from_xy(oval.right(), oval.top()))
+    }
+    None
+}
+
+/// Return the unit vectors pointing at the start/stop points for the given start/sweep angles
+fn angles_to_unit_vectors(start_angle: f32, sweep_angle: f32) -> (Point, Point, PathDirection) {
+    let start_rad = start_angle.to_radians();
+    let mut stop_rad = (start_angle + sweep_angle).to_radians();
+
+    let start_v = Point::from_xy(cos_snap_to_zero(start_rad), sin_snap_to_zero(start_rad));
+    let mut stop_v = Point::from_xy(cos_snap_to_zero(stop_rad), sin_snap_to_zero(stop_rad));
+
+    /*  If the sweep angle is nearly (but less than) 360, then due to precision
+     loss in radians-conversion and/or sin/cos, we may end up with coincident
+     vectors, which will fool SkBuildQuadArc into doing nothing (bad) instead
+     of drawing a nearly complete circle (good).
+     e.g. canvas.drawArc(0, 359.99, ...)
+     -vs- canvas.drawArc(0, 359.9, ...)
+     We try to detect this edge case, and tweak the stop vector
+     */
+    if start_v == stop_v {
+        let sw = sweep_angle.abs();
+        if sw < 360. && sw > 359. {
+            // make a guess at a tiny angle (in radians) to tweak by
+            let delta_rad = (1f32/512.).copysign(sweep_angle);
+            // not sure how much will be enough, so we use a loop
+            loop {
+                stop_rad -= delta_rad;
+                stop_v.x = cos_snap_to_zero(stop_rad);
+                stop_v.y = sin_snap_to_zero(stop_rad);
+                if start_v != stop_v {
+                    break
+                }
+            }
+        }
+    }
+    let dir = if sweep_angle > 0. { PathDirection::CW} else { PathDirection::CCW };
+    (start_v, stop_v, dir)
+}
+
+#[inline]
+fn cos_snap_to_zero(radians: f32) -> f32 {
+    let v = radians.cos();
+    if v.is_nearly_zero_within_tolerance(SCALAR_SIN_COS_NEARLY_ZERO) {
+        0.
+    }
+    else {
+        v
+    }
+}
+
+#[inline]
+fn sin_snap_to_zero(radians: f32) -> f32 {
+    let v = radians.sin();
+    if v.is_nearly_zero_within_tolerance(SCALAR_SIN_COS_NEARLY_ZERO) {
+        0.
+    }
+    else {
+        v
+    }
+}
+
+fn build_arc_conics(oval: Rect, start: Point, stop: Point, dir: PathDirection, conics: &mut [Conic; MAX_CONICS_FOR_ARC], single_pt: &mut Point) -> usize {
+    let mut matrix = Transform::from_scale(oval.width().half(), oval.height().half())
+        .post_translate(oval.center_x(), oval.center_y());
+
+    match Conic::build_unit_arc(start, stop, dir, matrix, conics) {
+        Some(conics) => conics.len(),
+        None => {
+            let mut result = stop;
+            matrix.map_point(&mut result);
+            *single_pt = result;
+            0
+        }
+    }
+}
+
+fn nearly_equal(a: Option<Point>, b: Point) -> bool {
+    a.map_or(false, |a| a.x.is_nearly_equal(b.x) && a.y.is_nearly_equal(b.y))
+}
+

@@ -5,7 +5,7 @@
 
 use core::convert::TryFrom;
 
-use crate::{FiniteF32, IntSize, LengthU32, PathBuilder, Point, SaturateRound, Size, Transform};
+use crate::{FiniteF32, IntSize, LengthU32, PathBuilder, Point, SaturateRound, Scalar, Size, Transform};
 
 #[cfg(all(not(feature = "std"), feature = "no-std-float"))]
 use crate::NoStdFloat;
@@ -303,6 +303,20 @@ impl Rect {
     pub fn height(&self) -> f32 {
         self.bottom.get() - self.top.get()
     }
+
+    #[inline]
+    pub fn center_x(&self) -> f32 {
+         self.left().half() + self.right().half()
+    }
+
+    #[inline]
+    pub fn center_y(&self) -> f32 {
+         self.top().half() + self.bottom().half()
+    }
+
+    // pub fn center(&self) -> Point {
+    //     Point::from_xy(self.center_x(), self.center_y())
+    // }
 
     /// Converts into an `IntRect` by adding 0.5 and discarding the fractional portion.
     ///
