@@ -5,7 +5,9 @@
 
 use core::convert::TryFrom;
 
-use crate::{FiniteF32, IntSize, LengthU32, PathBuilder, Point, SaturateRound, Scalar, Size, Transform};
+use crate::{
+    FiniteF32, IntSize, LengthU32, PathBuilder, Point, SaturateRound, Scalar, Size, Transform,
+};
 
 #[cfg(all(not(feature = "std"), feature = "no-std-float"))]
 use crate::NoStdFloat;
@@ -306,12 +308,12 @@ impl Rect {
 
     #[inline]
     pub fn center_x(&self) -> f32 {
-         self.left().half() + self.right().half()
+        self.left().half() + self.right().half()
     }
 
     #[inline]
     pub fn center_y(&self) -> f32 {
-         self.top().half() + self.bottom().half()
+        self.top().half() + self.bottom().half()
     }
 
     // pub fn center(&self) -> Point {
